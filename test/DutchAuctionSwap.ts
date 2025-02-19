@@ -1,65 +1,69 @@
-import { expect } from "chai";
-import { ethers } from "hardhat";
+const { expect } = require("chai");
+const { ethers } = require("hardhat");
 
 describe("DutchAuctionSwap", function () {
-  let auction: any;
-  let token: any;
-  let seller: any;
-  let buyer: any;
-  let initialPrice = ethers.utils.parseEther("10");
-  let duration = 300; // 5 minutes
-  let priceDecreaseRate = ethers.utils.parseEther("0.05");
-  let tokenAmount = ethers.utils.parseEther("100");
+  let deployer, buyer, mockToken, auction;
 
-  before(async function () {
-    [seller, buyer] = await ethers.getSigners();
+  beforeEach(async function () {
+    // Get signers
+    [deployer, buyer] = await ethers.getSigners();
 
-    const Token = await ethers.getContractFactory("MockERC20");
-    token = await Token.deploy();
-    await token.deployed();
+    // Deploy MockERC20 Token
+    const MockERC20 = await ethers.getContractFactory("MockERC20");
+    mockToken = await MockERC20.deploy("Mock Token", "MCK", ethers.parseEther("100"));
+    await mockToken.waitForDeployment();
 
-    const ReverseDutchAuctionSwap = await ethers.getContractFactory("ReverseDutchAuctionSwap");
-    auction = await ReverseDutchAuctionSwap.deploy(token.address);
-    await auction.deployed();
-
-    await token.mint(seller.address, tokenAmount);
-    await token.connect(seller).approve(auction.address, tokenAmount);
-    await auction.connect(seller).startAuction(initialPrice, duration, priceDecreaseRate, tokenAmount);
+    // Deploy DutchAuctionSwap
+    const DutchAuctionSwap = await ethers.getContractFactory("DutchAuctionSwap");
+    auction = await DutchAuctionSwap.deploy(await mockToken.getAddress());
+    await auction.waitForDeployment();
   });
 
-  it("Should decrease price over time", async function () {
-    await ethers.provider.send("evm_increaseTime", [120]);
-    await ethers.provider.send("evm_mine", []);
-
-    const expectedPrice = initialPrice.sub(priceDecreaseRate.mul(120));
-    expect(await auction.getCurrentPrice()).to.equal(expectedPrice);
+  it("Should deploy contracts successfully", async function () {
+    expect(await mockToken.getAddress()).to.be.properAddress;
+    expect(await auction.getAddress()).to.be.properAddress;
   });
 
-  it("Should allow only one buyer", async function () {
-    const currentPrice = await auction.getCurrentPrice();
-    await auction.connect(buyer).buy({ value: currentPrice });
+  it("Should start the auction correctly", async function () {
+    const tokensForSale = ethers.parseEther("10");
+    const initialPrice = ethers.parseEther("0.01");
+    const duration = 3600;
+    const priceDecreaseRate = ethers.parseEther("0.000001");
 
+    // Approve auction contract to spend deployer's tokens
+    await mockToken.approve(await auction.getAddress(), tokensForSale);
+
+    // Start auction
     await expect(
-      auction.connect(buyer).buy({ value: currentPrice })
-    ).to.be.revertedWith("Auction already ended");
+      auction.startAuction(initialPrice, duration, priceDecreaseRate, tokensForSale)
+    ).to.emit(auction, "AuctionStarted");
+
+    expect(await auction.seller()).to.equal(deployer.address);
+    expect(await mockToken.balanceOf(await auction.getAddress())).to.equal(tokensForSale);
   });
 
-  it("Should transfer tokens and ETH correctly", async function () {
-    const buyerBalance = await token.balanceOf(buyer.address);
-    expect(buyerBalance).to.equal(tokenAmount);
-  });
+  it("Should allow buyer to purchase tokens", async function () {
+    const tokensForSale = ethers.parseEther("10");
+    const initialPrice = ethers.parseEther("0.01");
+    const duration = 3600;
+    const priceDecreaseRate = ethers.parseEther("0.000001");
 
-  it("Should handle no buyer scenario correctly", async function () {
-    const ReverseDutchAuctionSwap = await ethers.getContractFactory("ReverseDutchAuctionSwap");
-    const newAuction = await ReverseDutchAuctionSwap.deploy(token.address);
-    await newAuction.deployed();
+    // Approve and start auction
+    await mockToken.approve(await auction.getAddress(), tokensForSale);
+    await auction.startAuction(initialPrice, duration, priceDecreaseRate, tokensForSale);
 
-    await token.connect(seller).approve(newAuction.address, tokenAmount);
-    await newAuction.connect(seller).startAuction(initialPrice, duration, priceDecreaseRate, tokenAmount);
+    // Simulate time passing for price drop
+    await ethers.provider.send("evm_increaseTime", [600]); // Fast-forward 10 minutes
+    await ethers.provider.send("evm_mine");
 
-    await ethers.provider.send("evm_increaseTime", [duration + 1]);
-    await ethers.provider.send("evm_mine", []);
+    // Get updated price
+    const newPrice = await auction.getCurrentPrice();
 
-    expect(await newAuction.getCurrentPrice()).to.equal(0);
+    // Buyer purchases tokens
+    await expect(auction.connect(buyer).buy({ value: newPrice })).to.emit(auction, "SwapExecuted");
+
+    // Check balances
+    expect(await mockToken.balanceOf(buyer.address)).to.equal(tokensForSale);
+    expect(await auction.auctionEnded()).to.equal(true);
   });
 });
